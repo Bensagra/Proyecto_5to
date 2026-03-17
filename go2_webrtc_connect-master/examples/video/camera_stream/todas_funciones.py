@@ -9,9 +9,8 @@ import numpy as np
 import torchvision
 import json
 import sys
-import platform
-from collections import deque
 from pathlib import Path
+from fractions import Fraction
 from torchvision.transforms import functional as F
 
 from unitree_webrtc_connect.webrtc_driver import (
@@ -20,16 +19,15 @@ from unitree_webrtc_connect.webrtc_driver import (
 )
 from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
 from aiortc import MediaStreamTrack
-from aiortc.contrib.media import MediaPlayer
-
+from av import AudioFrame
 import pyaudio
 
 
-# =========================================================
+# =========================
 # CONFIG
-# =========================================================
+# =========================
 CONFIDENCE_THRESHOLD = 0.55
-INPUT_WINDOW_NAME = "Unitree Go2 - Follow + Voice Chat"
+INPUT_WINDOW_NAME = "Unitree Go2 - Follow + Manual + Voice"
 USE_CUDA = torch.cuda.is_available()
 PERSON_CLASS_ID = 1
 
@@ -37,59 +35,69 @@ SAVE_DIR = Path("capturas_caras")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 MIN_SECONDS_BETWEEN_SAVES = 2.0
 
+# Seguimiento
 FOLLOW_ENABLED = True
+AUTONOMOUS_ENABLED = True
 INVERT_TURN = True
 MIRROR_IMAGE = False
-DEBUG_PRINTS = True
 
-# Movimiento
-COMMAND_INTERVAL = 0.02
-TARGET_LOST_TIMEOUT = 0.45
+# Comandos
+COMMAND_INTERVAL = 0.03
+TARGET_LOST_TIMEOUT = 0.55
 
-CENTER_DEAD_ZONE = 0.015
-MAX_TURN_SPEED = 1.6
-TURN_GAIN = 3.2
-
-MAX_FORWARD_SPEED = 2.1
-FAST_FORWARD_SPEED = 1.6
-MEDIUM_FORWARD_SPEED = 1.0
-MIN_FORWARD_SPEED = 0.35
-
-DESIRED_BOX_WIDTH = 0.22
-STOP_BOX_WIDTH = 0.40
-EMERGENCY_STOP_BOX_WIDTH = 0.50
-EMERGENCY_STOP_BOX_HEIGHT = 0.82
-
-SMOOTH_ERR_ALPHA = 0.58
-SMOOTHING_X = 0.08
-SMOOTHING_Y = 0.18
-SMOOTHING_Z = 0.10
-
+# Búsqueda si pierde target
 ENABLE_SEARCH_WHEN_LOST = False
-SEARCH_TURN_SPEED = 0.35
+SEARCH_TURN_SPEED = 0.40
 
-# Conversación
-TALK_BOX_WIDTH = 0.30               # ancho bbox para “ya estoy cerca para hablar”
-AUTO_VOICE_CHAT = True             # arranca solo al llegar
-STANDING_MIN_SECONDS = 1.8
-STANDING_CENTER_TOL = 0.05         # variación horizontal permitida
-STANDING_WIDTH_TOL = 0.08          # variación de tamaño permitida
-VOICE_CHAT_TIMEOUT = 180.0         # corta solo después de 3 min sin persona
+# Movimiento follow
+CENTER_DEAD_ZONE = 0.020
+MAX_FORWARD_SPEED = 1.60
+FAST_FORWARD_SPEED = 1.20
+MEDIUM_FORWARD_SPEED = 0.72
+MIN_FORWARD_SPEED = 0.28
+MAX_TURN_SPEED = 1.25
+TURN_GAIN = 3.60
 
-# Audio PC
-AUDIO_SAMPLE_RATE = 48000
-AUDIO_CHANNELS = 2
-AUDIO_FRAMES_PER_BUFFER = 8192
+DESIRED_BOX_WIDTH = 0.23
+STOP_BOX_WIDTH = 0.38
+EMERGENCY_STOP_BOX_WIDTH = 0.50
+EMERGENCY_STOP_BOX_HEIGHT = 0.84
 
-logging.basicConfig(level=logging.FATAL)
+SMOOTHING_X = 0.18
+SMOOTHING_Y = 0.25
+SMOOTHING_Z = 0.12
 
+SMOOTH_ERR_ALPHA = 0.60
 LAST_ERR_X = 0.0
 LAST_TURN_SIGN = 0
 
+# Target lock / foco
+FOCUS_LOCK_MAX_MISSES = 18
+FOCUS_DISTANCE_WEIGHT = 2.8
+FOCUS_IOU_WEIGHT = 5.0
+FOCUS_SCORE_WEIGHT = 1.2
+FOCUS_AREA_WEIGHT = 1.8
 
-# =========================================================
+# Audio manual
+VOICE_MANUAL_ONLY = True
+AUDIO_SAMPLE_RATE = 48000
+AUDIO_CHANNELS = 1
+AUDIO_CHUNK_SAMPLES = 960   # 20 ms @ 48k
+AUDIO_FORMAT = pyaudio.paInt16
+
+DEBUG_PRINTS = True
+logging.basicConfig(level=logging.FATAL)
+
+# OpenCV keycodes comunes
+KEY_UP = 2490368
+KEY_DOWN = 2621440
+KEY_LEFT = 2424832
+KEY_RIGHT = 2555904
+
+
+# =========================
 # FACE MEMORY
-# =========================================================
+# =========================
 class FaceMemory:
     def __init__(self, similarity_threshold=0.6):
         self.embeddings = []
@@ -97,8 +105,7 @@ class FaceMemory:
 
     def get_embedding(self, face_img):
         face = cv2.resize(face_img, (64, 64))
-        face = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-        face = cv2.resize(face, (64, 64))
+        face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
         face = face / 255.0
         return face.flatten()
 
@@ -118,9 +125,9 @@ class FaceMemory:
         return True
 
 
-# =========================================================
+# =========================
 # SSD DETECTOR
-# =========================================================
+# =========================
 class SSDPersonDetector:
     def __init__(self, confidence_threshold=0.55):
         self.confidence_threshold = confidence_threshold
@@ -136,7 +143,6 @@ class SSDPersonDetector:
     def detect(self, frame_bgr):
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         tensor = F.to_tensor(frame_rgb).to(self.device)
-
         outputs = self.model([tensor])[0]
 
         boxes = outputs["boxes"].detach().cpu().numpy()
@@ -151,13 +157,12 @@ class SSDPersonDetector:
                     "box": [x1, y1, x2, y2],
                     "score": float(score)
                 })
-
         return detections
 
 
-# =========================================================
+# =========================
 # FACE DETECTOR
-# =========================================================
+# =========================
 class FaceCropper:
     def __init__(self):
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -180,7 +185,6 @@ class FaceCropper:
             return None, None
 
         gray = cv2.cvtColor(person_roi, cv2.COLOR_BGR2GRAY)
-
         faces = self.face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.1,
@@ -206,13 +210,275 @@ class FaceCropper:
         return face_crop, global_box
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+# =========================
+# AUDIO
+# =========================
+class MicrophoneAudioTrack(MediaStreamTrack):
+    kind = "audio"
+
+    def __init__(self, rate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS, chunk_samples=AUDIO_CHUNK_SAMPLES):
+        super().__init__()
+        self.rate = rate
+        self.channels = channels
+        self.chunk_samples = chunk_samples
+        self.p = pyaudio.PyAudio()
+        self.stream = self.p.open(
+            format=AUDIO_FORMAT,
+            channels=channels,
+            rate=rate,
+            input=True,
+            frames_per_buffer=chunk_samples,
+        )
+        self.enabled = False
+        self._timestamp = 0
+
+    async def recv(self):
+        data = self.stream.read(self.chunk_samples, exception_on_overflow=False)
+
+        if not self.enabled:
+            data = b"\x00" * len(data)
+
+        samples = self.chunk_samples
+        layout = "mono" if self.channels == 1 else "stereo"
+
+        frame = AudioFrame(format="s16", layout=layout, samples=samples)
+        frame.planes[0].update(data)
+        frame.sample_rate = self.rate
+        frame.pts = self._timestamp
+        frame.time_base = Fraction(1, self.rate)
+        self._timestamp += samples
+        return frame
+
+    def close(self):
+        try:
+            self.stream.stop_stream()
+            self.stream.close()
+        except Exception:
+            pass
+        try:
+            self.p.terminate()
+        except Exception:
+            pass
+
+
+class VoiceChatManager:
+    def __init__(self, conn):
+        self.conn = conn
+        self.active = False
+        self.output_p = None
+        self.output_stream = None
+        self.mic_track = None
+        self.sender_attached = False
+        self.recv_callback_attached = False
+
+    def init_output(self):
+        if self.output_p is None:
+            self.output_p = pyaudio.PyAudio()
+            self.output_stream = self.output_p.open(
+                format=pyaudio.paInt16,
+                channels=AUDIO_CHANNELS,
+                rate=AUDIO_SAMPLE_RATE,
+                output=True,
+                frames_per_buffer=AUDIO_CHUNK_SAMPLES,
+            )
+
+    def init_mic(self):
+        if self.mic_track is None:
+            self.mic_track = MicrophoneAudioTrack()
+
+    def attach_sender_once(self):
+        if not self.sender_attached:
+            self.init_mic()
+            self.conn.pc.addTrack(self.mic_track)
+            self.sender_attached = True
+
+    async def recv_audio_stream(self, frame):
+        try:
+            audio_data = np.frombuffer(frame.to_ndarray(), dtype=np.int16)
+            if self.output_stream is not None:
+                self.output_stream.write(audio_data.tobytes())
+        except Exception as e:
+            print(f"[VOICE] Error reproduciendo audio: {e}")
+
+    async def start(self):
+        if self.active:
+            return
+
+        try:
+            self.init_output()
+            self.attach_sender_once()
+
+            if not self.recv_callback_attached:
+                self.conn.audio.add_track_callback(self.recv_audio_stream)
+                self.recv_callback_attached = True
+
+            self.mic_track.enabled = True
+            self.conn.audio.switchAudioChannel(True)
+            self.active = True
+            print("[VOICE] Chat de voz ACTIVADO")
+        except Exception as e:
+            print(f"[VOICE] Error activando voz: {e}")
+            await self.stop()
+
+    async def stop(self):
+        try:
+            self.conn.audio.switchAudioChannel(False)
+        except Exception:
+            pass
+
+        if self.mic_track is not None:
+            self.mic_track.enabled = False
+
+        self.active = False
+        print("[VOICE] Chat de voz DESACTIVADO")
+
+    def shutdown(self):
+        try:
+            if self.mic_track is not None:
+                self.mic_track.close()
+        except Exception:
+            pass
+        try:
+            if self.output_stream is not None:
+                self.output_stream.stop_stream()
+                self.output_stream.close()
+        except Exception:
+            pass
+        try:
+            if self.output_p is not None:
+                self.output_p.terminate()
+        except Exception:
+            pass
+
+
+# =========================
+# TARGET FOCUS / LOCK
+# =========================
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
 
+def box_area(box):
+    x1, y1, x2, y2 = box
+    return max(1, x2 - x1) * max(1, y2 - y1)
+
+
+def box_center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def box_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+
+    union = box_area(a) + box_area(b) - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+class FocusTracker:
+    def __init__(self):
+        self.locked_box = None
+        self.locked_score = 0.0
+        self.missed_frames = 0
+
+    def reset(self):
+        self.locked_box = None
+        self.locked_score = 0.0
+        self.missed_frames = 0
+
+    def update(self, det):
+        self.locked_box = det["box"][:]
+        self.locked_score = det["score"]
+        self.missed_frames = 0
+
+    def mark_missed(self):
+        self.missed_frames += 1
+        if self.missed_frames > FOCUS_LOCK_MAX_MISSES:
+            self.reset()
+
+    def has_lock(self):
+        return self.locked_box is not None
+
+
+def choose_target(detections, frame_shape, focus_tracker):
+    if not detections:
+        return None, None
+
+    h, w = frame_shape[:2]
+    frame_center_x = w / 2.0
+
+    # Si no hay lock, elegir el mejor general
+    if not focus_tracker.has_lock():
+        best_idx = None
+        best_val = -1e9
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2 = det["box"]
+            score = det["score"]
+            area = box_area(det["box"])
+            center_x = (x1 + x2) / 2.0
+            center_dist = abs(center_x - frame_center_x) / w
+            val = score * 2.0 + (area / (w * h)) * 2.5 - center_dist * 1.2
+            if val > best_val:
+                best_val = val
+                best_idx = i
+        return best_idx, detections[best_idx]
+
+    # Si hay lock, priorizar la misma persona
+    locked_box = focus_tracker.locked_box
+    locked_cx, locked_cy = box_center(locked_box)
+
+    best_idx = None
+    best_val = -1e9
+
+    for i, det in enumerate(detections):
+        det_box = det["box"]
+        score = det["score"]
+        det_cx, det_cy = box_center(det_box)
+        area = box_area(det_box)
+
+        iou_val = box_iou(det_box, locked_box)
+        dist = np.hypot(det_cx - locked_cx, det_cy - locked_cy) / max(w, h)
+
+        val = (
+            iou_val * FOCUS_IOU_WEIGHT
+            - dist * FOCUS_DISTANCE_WEIGHT
+            + score * FOCUS_SCORE_WEIGHT
+            + (area / (w * h)) * FOCUS_AREA_WEIGHT
+        )
+
+        if val > best_val:
+            best_val = val
+            best_idx = i
+
+    # Si el mejor match es muy malo, igual mantenemos lock un rato
+    if best_idx is None:
+        return None, None
+
+    best_det = detections[best_idx]
+    if box_iou(best_det["box"], locked_box) < 0.02:
+        det_cx, det_cy = box_center(best_det["box"])
+        dist = np.hypot(det_cx - locked_cx, det_cy - locked_cy) / max(w, h)
+        if dist > 0.30:
+            return None, None
+
+    return best_idx, best_det
+
+
+# =========================
+# FOLLOW HELPERS
+# =========================
 def save_face_crop(face_crop):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     millis = int((time.time() % 1) * 1000)
@@ -221,206 +487,7 @@ def save_face_crop(face_crop):
     return filename
 
 
-def box_center(box):
-    x1, y1, x2, y2 = box
-    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
-
-def choose_target(detections, frame_shape):
-    if not detections:
-        return None, None
-
-    h, w = frame_shape[:2]
-    frame_center_x = w / 2.0
-
-    best_idx = None
-    best_value = -1e9
-
-    for i, det in enumerate(detections):
-        x1, y1, x2, y2 = det["box"]
-        score = det["score"]
-
-        bw = max(1, x2 - x1)
-        bh = max(1, y2 - y1)
-        area = bw * bh
-        center_x = (x1 + x2) / 2.0
-        center_dist = abs(center_x - frame_center_x) / w
-
-        value = score * 2.0 + (area / (w * h)) * 2.7 - center_dist * 1.0
-
-        if value > best_value:
-            best_value = value
-            best_idx = i
-
-    return best_idx, detections[best_idx]
-
-
-# =========================================================
-# STANDING DETECTOR
-# =========================================================
-class StandingTracker:
-    def __init__(self, maxlen=90):
-        self.history = deque(maxlen=maxlen)
-
-    def reset(self):
-        self.history.clear()
-
-    def update(self, box, frame_shape):
-        h, w = frame_shape[:2]
-        cx, cy = box_center(box)
-        bw = max(1, box[2] - box[0])
-
-        self.history.append({
-            "t": time.time(),
-            "cx": cx / w,
-            "bw": bw / w,
-        })
-
-    def is_standing(self):
-        if len(self.history) < 10:
-            return False
-
-        duration = self.history[-1]["t"] - self.history[0]["t"]
-        if duration < STANDING_MIN_SECONDS:
-            return False
-
-        centers = [h["cx"] for h in self.history]
-        widths = [h["bw"] for h in self.history]
-
-        center_span = max(centers) - min(centers)
-        width_span = max(widths) - min(widths)
-
-        return center_span < STANDING_CENTER_TOL and width_span < STANDING_WIDTH_TOL
-
-
-# =========================================================
-# AUDIO CHAT
-# =========================================================
-class LiveVoiceChat:
-    def __init__(self, conn):
-        self.conn = conn
-        self.active = False
-        self.recv_enabled = False
-        self.send_enabled = False
-        self.pyaudio_instance = None
-        self.output_stream = None
-        self.input_player = None
-        self.started_at = 0.0
-
-    def _make_output(self):
-        self.pyaudio_instance = pyaudio.PyAudio()
-        self.output_stream = self.pyaudio_instance.open(
-            format=pyaudio.paInt16,
-            channels=AUDIO_CHANNELS,
-            rate=AUDIO_SAMPLE_RATE,
-            output=True,
-            frames_per_buffer=AUDIO_FRAMES_PER_BUFFER,
-        )
-
-    async def recv_audio_stream(self, frame):
-        try:
-            audio_data = np.frombuffer(frame.to_ndarray(), dtype=np.int16)
-            if self.output_stream is not None:
-                self.output_stream.write(audio_data.tobytes())
-        except Exception as e:
-            print(f"[VOICE] Error reproduciendo audio recibido: {e}")
-
-    def _create_mic_player(self):
-        """
-        Intento multiplataforma. Puede requerir ajustar la fuente exacta del micrófono.
-        """
-        system = platform.system().lower()
-
-        candidates = []
-        if system == "darwin":
-            candidates = [
-                ("default", None, None),
-                ("none:default", "avfoundation", None),
-                (":default", "avfoundation", None),
-            ]
-        elif system == "linux":
-            candidates = [
-                ("default", "pulse", None),
-                ("default", "alsa", None),
-            ]
-        elif system == "windows":
-            candidates = [
-                ("audio=Microphone", "dshow", None),
-            ]
-        else:
-            candidates = [("default", None, None)]
-
-        last_error = None
-        for source, fmt, opts in candidates:
-            try:
-                player = MediaPlayer(source, format=fmt, options=opts)
-                if player.audio is not None:
-                    print(f"[VOICE] Micrófono abierto con source={source} format={fmt}")
-                    return player
-            except Exception as e:
-                last_error = e
-
-        raise RuntimeError(f"No pude abrir micrófono. Último error: {last_error}")
-
-    async def start(self):
-        if self.active:
-            return
-
-        try:
-            # audio del robot -> parlantes compu
-            self._make_output()
-            self.conn.audio.switchAudioChannel(True)
-            self.conn.audio.add_track_callback(self.recv_audio_stream)
-            self.recv_enabled = True
-
-            # mic compu -> robot
-            self.input_player = self._create_mic_player()
-            if self.input_player.audio is not None:
-                self.conn.pc.addTrack(self.input_player.audio)
-                self.send_enabled = True
-
-            self.active = True
-            self.started_at = time.time()
-            print("[VOICE] Chat de voz activado")
-
-        except Exception as e:
-            print(f"[VOICE] No pude activar voz en vivo: {e}")
-            await self.stop()
-
-    async def stop(self):
-        self.active = False
-        self.recv_enabled = False
-        self.send_enabled = False
-
-        try:
-            self.conn.audio.switchAudioChannel(False)
-        except Exception:
-            pass
-
-        try:
-            if self.output_stream is not None:
-                self.output_stream.stop_stream()
-                self.output_stream.close()
-        except Exception:
-            pass
-
-        try:
-            if self.pyaudio_instance is not None:
-                self.pyaudio_instance.terminate()
-        except Exception:
-            pass
-
-        self.output_stream = None
-        self.pyaudio_instance = None
-        self.input_player = None
-
-        print("[VOICE] Chat de voz detenido")
-
-
-# =========================================================
-# CONTROL
-# =========================================================
-def compute_follow_command(target_det, frame_shape, prefer_talk_distance=False):
+def compute_follow_command(target_det, frame_shape):
     global LAST_ERR_X, LAST_TURN_SIGN
 
     h, w = frame_shape[:2]
@@ -441,68 +508,85 @@ def compute_follow_command(target_det, frame_shape, prefer_talk_distance=False):
     rel_box_w = box_w / float(w)
     rel_box_h = box_h / float(h)
 
-    # giro
+    # -------------------------
+    # GIRO MÁS FUERTE
+    # -------------------------
     z = 0.0
     abs_err = abs(err_x)
+    dead_zone = CENTER_DEAD_ZONE
 
-    if abs_err > CENTER_DEAD_ZONE:
-        z_mag = clamp(abs_err * TURN_GAIN, 0.22, MAX_TURN_SPEED)
+    if abs_err > dead_zone:
+        # giro más rápido cuando el target dobla
+        norm_err = (abs_err - dead_zone) / max(1e-6, (1.0 - dead_zone))
+        norm_err = clamp(norm_err, 0.0, 1.0)
+
+        # curva más agresiva que antes
+        turn_strength = norm_err ** 1.15
+        z_mag = 0.18 + turn_strength * (MAX_TURN_SPEED - 0.18)
+
         turn_sign = -1.0 if err_x < 0 else 1.0
 
-        if LAST_TURN_SIGN != 0 and abs_err < 0.08:
+        # poca histéresis, para no hacerlo lento al doblar
+        if LAST_TURN_SIGN != 0 and abs_err < 0.06:
             turn_sign = LAST_TURN_SIGN
 
         LAST_TURN_SIGN = turn_sign
         z = turn_sign * z_mag
     else:
-        LAST_TURN_SIGN = 0
         z = 0.0
+        LAST_TURN_SIGN = 0
 
     if INVERT_TURN:
         z = -z
 
-    # distancia
-    desired_width = TALK_BOX_WIDTH if prefer_talk_distance else DESIRED_BOX_WIDTH
-    distance_error = desired_width - rel_box_w
+    # -------------------------
+    # DISTANCIA / VELOCIDAD
+    # -------------------------
+    distance_error = DESIRED_BOX_WIDTH - rel_box_w
     too_close = rel_box_w >= STOP_BOX_WIDTH or rel_box_h >= 0.78
     emergency_close = rel_box_w >= EMERGENCY_STOP_BOX_WIDTH or rel_box_h >= EMERGENCY_STOP_BOX_HEIGHT
 
     if emergency_close:
         x = 0.0
         z = 0.0
-        mode = "EMERGENCY_STOP"
+        mode = "emergency_stop"
+
     elif too_close:
         x = 0.0
-        mode = "STOP_CLOSE"
+        mode = "too_close_stop"
+
     else:
-        if abs_err > 0.60:
-            turn_factor = 0.45
-        elif abs_err > 0.40:
-            turn_factor = 0.65
-        elif abs_err > 0.25:
-            turn_factor = 0.82
+        # menos castigo al avanzar mientras gira
+        if abs_err < 0.10:
+            turn_penalty = 1.0
+        elif abs_err < 0.22:
+            turn_penalty = 0.93
+        elif abs_err < 0.35:
+            turn_penalty = 0.82
         else:
-            turn_factor = 1.0
+            turn_penalty = 0.68
+
+        kp_forward = 8.0
+        raw_x = max(0.0, distance_error * kp_forward)
+        raw_x *= turn_penalty
 
         if distance_error > 0.12:
-            x = MAX_FORWARD_SPEED * turn_factor
-            mode = "RUN_MAX"
+            x = clamp(max(raw_x, FAST_FORWARD_SPEED), 0.0, MAX_FORWARD_SPEED)
+            mode = "run"
         elif distance_error > 0.06:
-            x = FAST_FORWARD_SPEED * turn_factor
-            mode = "FAST_FOLLOW"
+            x = clamp(max(raw_x, MEDIUM_FORWARD_SPEED), 0.0, FAST_FORWARD_SPEED)
+            mode = "fast_follow"
         elif distance_error > 0.02:
-            x = MEDIUM_FORWARD_SPEED * turn_factor
-            mode = "MEDIUM_FOLLOW"
+            x = clamp(raw_x, 0.0, MEDIUM_FORWARD_SPEED)
+            if abs_err < 0.25:
+                x = max(x, MIN_FORWARD_SPEED)
+            mode = "slow_follow"
         elif distance_error > -0.01:
             x = 0.0
-            mode = "HOLD_DISTANCE"
+            mode = "hold_distance"
         else:
             x = 0.0
-            mode = "CLOSE_STOP"
-
-        x = clamp(x, 0.0, MAX_FORWARD_SPEED)
-        if x > 0.0 and abs_err < 0.20:
-            x = max(x, MIN_FORWARD_SPEED)
+            mode = "close_stop"
 
     return {
         "x": float(x),
@@ -510,15 +594,21 @@ def compute_follow_command(target_det, frame_shape, prefer_talk_distance=False):
         "z": float(z),
         "err_x": float(err_x),
         "rel_box_w": float(rel_box_w),
-        "rel_box_h": float(rel_box_h),
         "mode": mode,
     }
 
 
-# =========================================================
-# VISUALIZACIÓN
-# =========================================================
-def draw_detections(frame, detections, face_boxes=None, fps=None, follow_info=None, robot_mode="SEARCH", standing=False, voice_on=False):
+def draw_detections(
+    frame,
+    detections,
+    face_boxes=None,
+    fps=None,
+    follow_info=None,
+    voice_on=False,
+    robot_mode="AUTO",
+    autonomous_enabled=True,
+    focus_locked=False,
+):
     output = frame.copy()
 
     for i, det in enumerate(detections):
@@ -533,14 +623,31 @@ def draw_detections(frame, detections, face_boxes=None, fps=None, follow_info=No
 
         label = f"Persona {score:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-
         cv2.rectangle(output, (x1, max(0, y1 - th - 10)), (x1 + tw + 8, y1), color, -1)
-        cv2.putText(output, label, (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            output,
+            label,
+            (x1 + 4, y1 - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA
+        )
 
     if face_boxes:
         for (fx1, fy1, fx2, fy2) in face_boxes:
             cv2.rectangle(output, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
-            cv2.putText(output, "Cara", (fx1, max(20, fy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                output,
+                "Cara",
+                (fx1, max(20, fy1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 0, 0),
+                2,
+                cv2.LINE_AA
+            )
 
     h, w = output.shape[:2]
     cx = w // 2
@@ -549,26 +656,33 @@ def draw_detections(frame, detections, face_boxes=None, fps=None, follow_info=No
     if fps is not None:
         cv2.putText(output, f"FPS: {fps:.1f}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
 
-    cv2.putText(output, f"Personas detectadas: {len(detections)}", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(output, f"STATE: {robot_mode}", (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2, cv2.LINE_AA)
-    cv2.putText(output, f"STANDING: {'YES' if standing else 'NO'}", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(output, f"VOICE: {'ON' if voice_on else 'OFF'}", (20, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0) if voice_on else (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.putText(output, f"Personas detectadas: {len(detections)}", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(output, f"Modo: {robot_mode}", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(output, f"Autonomo: {'ON' if autonomous_enabled else 'OFF'}", (20, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0,255,0) if autonomous_enabled else (0,0,255), 2, cv2.LINE_AA)
+    cv2.putText(output, f"Voice: {'ON' if voice_on else 'OFF'}", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0,255,0) if voice_on else (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(output, f"Focus lock: {'ON' if focus_locked else 'OFF'}", (20, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0,255,0) if focus_locked else (255,255,255), 2, cv2.LINE_AA)
 
     if follow_info:
-        text = (
-            f"x={follow_info['x']:.2f} "
-            f"z={follow_info['z']:.2f} "
-            f"boxW={follow_info['rel_box_w']:.2f} "
-            f"mode={follow_info['mode']}"
-        )
-        cv2.putText(output, text, (20, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2, cv2.LINE_AA)
+        text = f"x={follow_info['x']:.2f} z={follow_info['z']:.2f} mode={follow_info['mode']}"
+        cv2.putText(output, text, (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 200, 255), 2, cv2.LINE_AA)
+
+    cv2.putText(
+        output,
+        "Teclas: A auto on/off | V voz on/off | Flechas/WASD mover | SPACE stop | R reset foco | N normal mode | Q salir",
+        (20, h - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
     return output
 
 
-# =========================================================
+# =========================
 # FOLLOWER
-# =========================================================
+# =========================
 class RobotFollower:
     def __init__(self, conn):
         self.conn = conn
@@ -713,15 +827,17 @@ class RobotFollower:
                     self.last_cmd_time = now
 
 
-# =========================================================
+# =========================
 # MAIN
-# =========================================================
+# =========================
 def main():
+    global AUTONOMOUS_ENABLED
+
     face_memory = FaceMemory(similarity_threshold=0.55)
-    standing_tracker = StandingTracker()
+    focus_tracker = FocusTracker()
     frame_queue = queue.Queue(maxsize=10)
 
-    # Elegí la conexión que uses
+    # Elegí una conexión
     # conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip="192.168.8.181")
     # conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, serialNumber="B42D2000P7I9GF8A")
     conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalAP)
@@ -729,15 +845,14 @@ def main():
     detector = SSDPersonDetector(confidence_threshold=CONFIDENCE_THRESHOLD)
     face_cropper = FaceCropper()
     follower = RobotFollower(conn)
-    voice_chat = LiveVoiceChat(conn)
-
-    robot_mode = "SEARCH"
+    voice_chat = VoiceChatManager(conn)
 
     blank = np.zeros((720, 1280, 3), dtype=np.uint8)
     cv2.imshow(INPUT_WINDOW_NAME, blank)
     cv2.waitKey(1)
 
     last_save_time = 0.0
+    robot_mode = "AUTO"
 
     async def recv_camera_stream(track: MediaStreamTrack):
         while True:
@@ -760,6 +875,9 @@ def main():
                 await conn.connect()
                 print("[WEBRTC] Conectado.")
 
+                # preparar audio sender una vez
+                voice_chat.attach_sender_once()
+
                 conn.video.switchVideoChannel(True)
                 conn.video.add_track_callback(recv_camera_stream)
                 print("[VIDEO] Stream activado.")
@@ -779,7 +897,6 @@ def main():
     asyncio_thread.start()
 
     prev_time = time.time()
-    last_person_seen_time = 0.0
 
     try:
         while True:
@@ -791,77 +908,30 @@ def main():
                 follow_info = None
                 target_idx = None
                 now = time.time()
-                standing = False
 
-                if FOLLOW_ENABLED and len(detections) > 0:
-                    last_person_seen_time = now
-                    target_idx, target_det = choose_target(detections, frame.shape)
+                if detections:
+                    idx, target_det = choose_target(detections, frame.shape, focus_tracker)
 
                     if target_det is not None:
-                        standing_tracker.update(target_det["box"], frame.shape)
-                        standing = standing_tracker.is_standing()
+                        focus_tracker.update(target_det)
 
-                        rel_box_w = (target_det["box"][2] - target_det["box"][0]) / float(frame.shape[1])
-
-                        # estados
-                        if voice_chat.active:
-                            robot_mode = "VOICE_CHAT"
-                            follower.clear_target()
-                            if rel_box_w < 0.20:
-                                # se alejó mucho
-                                future = asyncio.run_coroutine_threadsafe(voice_chat.stop(), loop)
-                                future.result(timeout=5)
-                                robot_mode = "SEARCH"
-
+                        if AUTONOMOUS_ENABLED and not voice_chat.active:
+                            robot_mode = "AUTO"
+                            target_idx = idx
+                            cmd = compute_follow_command(target_det, frame.shape)
+                            follow_info = {**cmd, "target_idx": target_idx}
+                            follower.update_target(follow_info)
                         else:
-                            if standing and rel_box_w < TALK_BOX_WIDTH:
-                                robot_mode = "APPROACH_TO_TALK"
-                                cmd = compute_follow_command(target_det, frame.shape, prefer_talk_distance=True)
-                                follow_info = {**cmd, "target_idx": target_idx}
-                                follower.update_target(follow_info)
-
-                            elif standing and rel_box_w >= TALK_BOX_WIDTH:
-                                robot_mode = "READY_TO_TALK"
-                                follow_info = {
-                                    "x": 0.0,
-                                    "y": 0.0,
-                                    "z": 0.0,
-                                    "err_x": 0.0,
-                                    "rel_box_w": rel_box_w,
-                                    "rel_box_h": (target_det["box"][3] - target_det["box"][1]) / float(frame.shape[0]),
-                                    "mode": "READY_TO_TALK",
-                                    "target_idx": target_idx,
-                                }
-                                follower.update_target(follow_info)
-
-                                if AUTO_VOICE_CHAT:
-                                    future = asyncio.run_coroutine_threadsafe(follower.hard_stop(), loop)
-                                    future.result(timeout=3)
-                                    future = asyncio.run_coroutine_threadsafe(voice_chat.start(), loop)
-                                    future.result(timeout=10)
-                                    robot_mode = "VOICE_CHAT"
-
-                            else:
-                                robot_mode = "FOLLOW"
-                                cmd = compute_follow_command(target_det, frame.shape, prefer_talk_distance=False)
-                                follow_info = {**cmd, "target_idx": target_idx}
-                                follower.update_target(follow_info)
+                            robot_mode = "MANUAL" if not voice_chat.active else "VOICE_CHAT"
+                            follower.clear_target()
                     else:
-                        robot_mode = "SEARCH"
-                        follower.clear_target()
-                        standing_tracker.reset()
+                        focus_tracker.mark_missed()
+                        if AUTONOMOUS_ENABLED and not voice_chat.active:
+                            follower.clear_target()
                 else:
-                    follower.clear_target()
-                    standing_tracker.reset()
-                    standing = False
-                    if voice_chat.active:
-                        robot_mode = "VOICE_CHAT"
-                        if now - last_person_seen_time > VOICE_CHAT_TIMEOUT:
-                            future = asyncio.run_coroutine_threadsafe(voice_chat.stop(), loop)
-                            future.result(timeout=5)
-                            robot_mode = "SEARCH"
-                    else:
-                        robot_mode = "SEARCH"
+                    focus_tracker.mark_missed()
+                    if AUTONOMOUS_ENABLED and not voice_chat.active:
+                        follower.clear_target()
 
                 for det in detections:
                     person_box = det["box"]
@@ -892,37 +962,96 @@ def main():
                     face_boxes=face_boxes,
                     fps=fps,
                     follow_info=follow_info,
-                    robot_mode=robot_mode,
-                    standing=standing,
                     voice_on=voice_chat.active,
+                    robot_mode=robot_mode,
+                    autonomous_enabled=AUTONOMOUS_ENABLED,
+                    focus_locked=focus_tracker.has_lock(),
                 )
                 cv2.imshow(INPUT_WINDOW_NAME, output)
 
-                key = cv2.waitKey(1) & 0xFF
+                key = cv2.waitKeyEx(1)
+
+                # salir
                 if key == ord("q"):
                     break
-                elif key == ord("s"):
-                    print("[KEY] STOP manual")
+
+                # toggle autónomo
+                elif key == ord("a"):
+                    AUTONOMOUS_ENABLED = not AUTONOMOUS_ENABLED
+                    print(f"[KEY] Autonomo {'ON' if AUTONOMOUS_ENABLED else 'OFF'}")
                     future = asyncio.run_coroutine_threadsafe(follower.hard_stop(), loop)
                     future.result(timeout=3)
-                elif key == ord("n"):
-                    print("[KEY] Reforzando modo normal")
-                    future = asyncio.run_coroutine_threadsafe(follower.ensure_normal_mode(), loop)
-                    future.result(timeout=6)
+                    follower.clear_target()
+                    robot_mode = "AUTO" if AUTONOMOUS_ENABLED else "MANUAL"
+
+                # toggle voz manual únicamente
                 elif key == ord("v"):
-                    # toggle voz manual
+                    future = asyncio.run_coroutine_threadsafe(follower.hard_stop(), loop)
+                    future.result(timeout=3)
+                    follower.clear_target()
+
                     if voice_chat.active:
                         print("[KEY] Voice OFF")
                         future = asyncio.run_coroutine_threadsafe(voice_chat.stop(), loop)
                         future.result(timeout=5)
-                        robot_mode = "SEARCH"
+                        robot_mode = "MANUAL" if not AUTONOMOUS_ENABLED else "AUTO"
                     else:
                         print("[KEY] Voice ON")
-                        future = asyncio.run_coroutine_threadsafe(follower.hard_stop(), loop)
-                        future.result(timeout=3)
                         future = asyncio.run_coroutine_threadsafe(voice_chat.start(), loop)
                         future.result(timeout=10)
                         robot_mode = "VOICE_CHAT"
+
+                # forzar normal mode
+                elif key == ord("n"):
+                    print("[KEY] Reforzando modo normal")
+                    future = asyncio.run_coroutine_threadsafe(follower.ensure_normal_mode(), loop)
+                    future.result(timeout=6)
+
+                # reset foco
+                elif key == ord("r"):
+                    print("[KEY] Reset foco")
+                    focus_tracker.reset()
+
+                # stop manual
+                elif key == ord("s") or key == 32:
+                    print("[KEY] STOP manual")
+                    future = asyncio.run_coroutine_threadsafe(follower.hard_stop(), loop)
+                    future.result(timeout=3)
+
+                # Manual movement only if autonomous OFF and voice OFF
+                elif not AUTONOMOUS_ENABLED and not voice_chat.active:
+                    robot_mode = "MANUAL"
+
+                    manual_x = 0.0
+                    manual_z = 0.0
+
+                    # Flechas
+                    if key == KEY_UP:
+                        manual_x = 1.0
+                    elif key == KEY_DOWN:
+                        manual_x = -0.6
+                    elif key == KEY_LEFT:
+                        manual_z = 0.9
+                    elif key == KEY_RIGHT:
+                        manual_z = -0.9
+
+                    # WASD backup
+                    elif key == ord("w"):
+                        manual_x = 1.0
+                    elif key == ord("x"):
+                        manual_x = -0.6
+                    elif key == ord("a"):  # ya usado para toggle, no pisa por el elif anterior
+                        pass
+                    elif key == ord("j"):
+                        manual_z = 0.9
+                    elif key == ord("l"):
+                        manual_z = -0.9
+
+                    if manual_x != 0.0 or manual_z != 0.0:
+                        future = asyncio.run_coroutine_threadsafe(
+                            follower.send_move(manual_x, 0.0, manual_z), loop
+                        )
+                        future.result(timeout=3)
 
             else:
                 time.sleep(0.005)
@@ -937,6 +1066,11 @@ def main():
         try:
             future = asyncio.run_coroutine_threadsafe(follower.hard_stop(), loop)
             future.result(timeout=3)
+        except Exception:
+            pass
+
+        try:
+            voice_chat.shutdown()
         except Exception:
             pass
 
