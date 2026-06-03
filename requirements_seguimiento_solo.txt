@@ -1,0 +1,9 @@
+# Runtime dependencies for:
+# go2_webrtc_connect-master/examples/video/camera_stream/seguimiento_solo.py
+
+aiortc>=1.6,<2
+numpy>=1.26,<3
+opencv-python>=4.8,<5
+torch>=2.2,<3
+torchvision>=0.17,<1
+unitree-webrtc-connect>=2.0.5,<3
