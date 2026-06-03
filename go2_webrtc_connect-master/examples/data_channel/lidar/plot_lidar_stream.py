@@ -17,9 +17,16 @@ from datetime import datetime
 import os
 import sys
 import ast
+from pathlib import Path
 
-# Increase the field size limit for CSV reading
-csv.field_size_limit(sys.maxsize)
+# Prefer the local checkout of legion1581/unitree_webrtc_connect when this
+# project is run from the workspace, even if another version is installed.
+LOCAL_UNITREE_ROOT = Path(__file__).resolve().parents[4] / "unitree_webrtc_connect"
+if (LOCAL_UNITREE_ROOT / "unitree_webrtc_connect" / "webrtc_driver.py").exists():
+    sys.path.insert(0, str(LOCAL_UNITREE_ROOT))
+
+from unitree_webrtc_connect.constants import RTC_TOPIC
+from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection, WebRTCConnectionMethod
 
 # Flask app and SocketIO setup
 app = Flask(__name__)

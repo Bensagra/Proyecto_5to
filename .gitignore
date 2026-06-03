@@ -1,31 +1,68 @@
-# Ignore Python bytecode
+# Python
 __pycache__/
 *.py[cod]
-# Logs and runtime files
-log/
-
-# Ignore the re/ directory
-re/
-
-# Ignore egg-info directories
+*.pyo
+*.pyd
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Ignore OS specific files
-.DS_Store
-Thumbs.db
-
-# Ignore virtual environments (if applicable)
+# Virtual environments
+.venv/
+.venv_*/
 venv/
 env/
 
-# Ignore IDE specific files (optional, if you're using an IDE like PyCharm, VS Code, etc.)
+# Build artifacts
+build/
+dist/
+*.egg
+
+# Logs and temporary runtime files
+log/
+logs/
+*.log
+tmp/
+temp/
+
+# Local IDE and assistant settings
 .idea/
 .vscode/
+.claude/
+*.code-workspace
+CLAUDE.md
 
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated media and local captures
+capturas_caras/
+**/capturas_caras/
 output.wav
 output_video.mp4
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mp3
 
-build/
-
-CLAUDE.md
+# Training datasets, model outputs and predictions
 *.csv
+*.pt
+*.pth
+*.onnx
+*.engine
+checkpoints/
+yolo_dataset/
+yolo_results/
+predictions/
+runs/
+scan_output/
+
+# Local external checkouts
+unitree_webrtc_connect/
+
+# Legacy/local scratch folders
+re/
